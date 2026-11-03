@@ -1,0 +1,24 @@
+services:
+  db:
+    image: alpine:3.21
+    command: ["sh", "-c", "while true; do sleep 30; done"]
+    volumes:
+      - db-data:/var/lib/db
+  client:
+    build: .
+    depends_on:
+      - db
+    volumes:
+      - app-data:/var/lib/pilot
+      - ./assets:/opt/pilot-data:ro
+      - ./tests:/cdb-tests:ro
+    labels:
+      cdb.test_command: "sh /tmp/cdb-tests/run-tests.sh $${CDB_TEST_PHASE:-vulnerable}"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+volumes:
+  app-data: {}
+  db-data: {}

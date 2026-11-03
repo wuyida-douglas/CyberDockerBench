@@ -1,0 +1,27 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+# Every controller exec gets a separate session/process group. The PID record
+# allows a timeout to kill that command (including children), never dockerd.
+[[ $# -ge 2 ]]
+token=$1
+shift
+[[ "$token" =~ ^[0-9a-f]{32}$ ]]
+record=/run/cybergym-exec/$token
+setsid "$@" &
+child=$!
+printf '%s\n' "$child" > "$record.pid"
+term() {
+    trap - TERM INT
+    kill -TERM -- "-$child" 2>/dev/null || true
+    sleep 2
+    kill -KILL -- "-$child" 2>/dev/null || true
+}
+trap term TERM INT
+set +e
+wait "$child"
+rc=$?
+set -e
+printf '%s\n' "$rc" > "$record.exit"
+rm -f "$record.pid"
+exit "$rc"

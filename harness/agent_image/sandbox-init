@@ -1,0 +1,62 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+# One outer container owns this task's daemon, agent, storage and lifetime.
+# Always initialize runtime/device permissions before command dispatch. Direct
+# debugging commands need the same /run/cdb-exec and device contract as dockerd.
+mkdir -p /var/lib/docker /var/log /workspace
+mkdir -p /run/cdb-exec
+chmod 1777 /tmp /run/cdb-exec
+# The dedicated worker's runtime creates device nodes with mode 0600. Ordinary
+# CLI tools (pip, git, Claude) need the conventional null/zero/full devices.
+for device in null zero full random urandom tty; do
+    if [[ -e "/dev/$device" ]]; then
+        chmod 0666 "/dev/$device"
+    fi
+done
+if ! getent group docker >/dev/null; then
+    groupadd --system docker
+fi
+usermod -a -G docker agent
+
+# Docker daemon ignores ordinary client shell proxy variables. Supply them
+# explicitly to this private daemon, never to application containers.
+if [[ -f /etc/docker/daemon-proxy.conf ]]; then
+    while IFS= read -r line; do
+        case "$line" in Environment=*)
+            value="${line#Environment=}"
+            value="${value#\"}"; value="${value%\"}"
+            export "${value?}"
+            ;;
+        esac
+    done < /etc/docker/daemon-proxy.conf
+fi
+
+args=(
+    --host=unix:///var/run/docker.sock
+    --storage-driver=${CDB_STORAGE_DRIVER:-vfs}
+    --iptables=true
+    --ip-forward=true
+    --ip-masq=true
+)
+if [[ -n "${CDB_DIND_MTU:-}" ]]; then
+    args+=(--mtu "$CDB_DIND_MTU")
+fi
+if [[ "${1:-}" == "dockerd" ]]; then
+    shift
+elif [[ $# -gt 0 && "${1:-}" != --* ]]; then
+    # Direct inspection/debug commands retain the initialized device and
+    # account permissions without unnecessarily starting a Docker daemon.
+    exec "$@"
+fi
+
+echo "[sandbox] starting private dockerd; agent access is through /var/run/docker.sock"
+dockerd "${args[@]}" "$@" &
+daemon=$!
+term() {
+    kill -TERM "$daemon" 2>/dev/null || true
+    wait "$daemon" || true
+    exit 0
+}
+trap term TERM INT
+wait "$daemon"

@@ -1,0 +1,80 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+# PID 1 is tini. This supervisor owns exactly this outer container's dockerd;
+# Claude is launched later as agent by a separate controller docker exec.
+if [[ $# -gt 0 ]]; then
+    exec "$@"
+fi
+: "${CYBERGYM_DOCKER_ROOT:?CYBERGYM_DOCKER_ROOT is required}"
+# The controller passes the base it used (default /var/tmp/cybergym-docker;
+# /nvme/... on the worker). The root must stay under that approved base.
+[[ "$CYBERGYM_DOCKER_ROOT" == "${CYBERGYM_DOCKER_ROOT_BASE:-/var/tmp/cybergym-docker}"/* ]]
+mkdir -p "$CYBERGYM_DOCKER_ROOT" /run/cybergym-exec /workspace /home/agent
+chmod 1777 /tmp
+# Some dedicated workers supply restrictive umasks or host-created device
+# nodes. A normal unprivileged CLI needs these standard devices regardless.
+chmod 0666 /dev/null /dev/zero /dev/full /dev/random /dev/urandom /dev/tty 2>/dev/null || true
+if [[ -e /dev/fuse ]]; then chmod 0666 /dev/fuse; fi
+chown agent:agent /run/cybergym-exec /home/agent
+if ! getent group docker >/dev/null; then
+    groupadd --system docker
+fi
+usermod -a -G docker agent
+
+# Overlay cannot be nested on common container workers. The local /var/tmp
+# contract is still enforced; select fuse-overlayfs only for that filesystem.
+# Native ext4/xfs/btrfs roots retain the faster kernel overlay2 driver.
+driver=overlay2
+fs_type=$(stat -f -c %T "$CYBERGYM_DOCKER_ROOT")
+if [[ "$fs_type" == overlayfs ]]; then
+    command -v fuse-overlayfs >/dev/null
+    driver=fuse-overlayfs
+fi
+exec > >(tee -a /var/log/cybergym-init.log) 2>&1
+resolver=$(awk '$1 == "nameserver" && $2 !~ /^127\./ { print $2; exit }' /etc/resolv.conf)
+if [[ -z "$resolver" ]]; then resolver=127.0.0.11; fi
+# The bridge does not exist until dockerd creates it; bind DNS only afterwards.
+dns_pid=""
+start_dns() {
+    for _ in $(seq 1 60); do
+        if ip -4 addr show dev docker0 2>/dev/null | grep -q 'inet 10\.160\.0\.1/'; then
+            dnsmasq --keep-in-foreground --no-daemon --user=root --conf-file=/dev/null \
+                --no-dhcp-interface=docker0 --no-ping \
+                --no-hosts --no-resolv --server="$resolver" --listen-address=10.160.0.1 \
+                --bind-interfaces --cache-size=1000 >>/var/log/cybergym-dns.log 2>&1 &
+            dns_pid=$!
+            return
+        fi
+        sleep 0.25
+    done
+    echo "[cybergym] private docker0 bridge did not become ready" >&2
+    return 1
+}
+args=(
+    --data-root="$CYBERGYM_DOCKER_ROOT"
+    --dns=10.160.0.1
+    --host=unix:///var/run/docker.sock
+    --group=docker
+    --storage-driver="$driver"
+    --iptables=true
+    --ip-forward=true
+    --ip-masq=true
+)
+if [[ -n "${CYBERGYM_DIND_MTU:-}" ]]; then
+    args+=(--mtu "$CYBERGYM_DIND_MTU")
+fi
+
+echo "[cybergym] starting private dockerd on /var/run/docker.sock"
+dockerd "${args[@]}" > >(tee -a /var/log/cybergym-dockerd.log) 2>&1 &
+daemon=$!
+term() {
+    trap - TERM INT
+    kill -TERM "$daemon" 2>/dev/null || true
+    wait "$daemon" || true
+    if [[ -n "$dns_pid" ]]; then kill -TERM "$dns_pid" 2>/dev/null || true; wait "$dns_pid" || true; fi
+    exit 0
+}
+trap term TERM INT
+start_dns
+wait "$daemon"

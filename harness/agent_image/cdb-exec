@@ -1,0 +1,30 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+# One controller command per session/process group. The token lets the host
+# stop a timed-out command without signalling dockerd or another agent exec.
+[[ $# -ge 2 ]]
+token=$1
+shift
+[[ "$token" =~ ^[0-9a-f]{32}$ ]]
+record=/run/cdb-exec/$token
+# Root initializes this directory. Never chmod a root-owned sticky directory
+# as the unprivileged agent; just use its existing write permission.
+mkdir -m 1777 -p /run/cdb-exec 2>/dev/null || true
+setsid "$@" &
+child=$!
+printf '%s\n' "$child" > "$record.pid"
+term() {
+    trap - TERM INT
+    kill -TERM -- "-$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
+    rm -f "$record.pid"
+    exit 143
+}
+trap term TERM INT
+set +e
+wait "$child"
+rc=$?
+set -e
+rm -f "$record.pid"
+exit "$rc"

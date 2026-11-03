@@ -1,0 +1,8 @@
+{
+  "api_version": 1,
+  "family": "cvefactory",
+  "description": "CVE-Factory vulnerable-source reproduction and four-phase bugfix grading",
+  "aliases": ["bugfix"],
+  "entrypoint": "plugin.py",
+  "factory": "create_plugin"
+}

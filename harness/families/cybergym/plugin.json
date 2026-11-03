@@ -1,0 +1,5 @@
+{
+  "api_version": 1,
+  "family": "cybergym",
+  "description": "Source-only OSS-Fuzz dual-version sanitizer environment synthesis"
+}

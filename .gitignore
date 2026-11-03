@@ -1,0 +1,32 @@
+# Runtime outputs and generated evaluation evidence.
+runtime/
+results/
+run/
+archive/
+
+# Task packages, private gold, reference solutions, and submitted deliveries.
+delivery/
+tasks/
+历史记录/
+
+# Local model endpoints and credentials. Configure with CDB_MODEL_ENV_FILE.
+config/
+.env
+.env.*
+*.pem
+*.key
+
+# Editor, test, and build artifacts.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+node_modules/
+
+# Vendored runtimes and offline dependency bundles are local deployment artifacts.
+harness/agent_image/node/
+harness/test-bootstrap/
+
+.DS_Store
+*.swp
+*.log

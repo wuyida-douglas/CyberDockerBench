@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Resolve Docker Hub base images through the cache, then kkRepo.
+
+Build and Compose inputs are adapted in memory or temporary files.
+Task Dockerfiles and Compose files are never modified.
+"""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+REAL = next((path for path in ("/usr/bin/docker", "/usr/local/bin/docker-real")
+             if Path(path).is_file()), "/usr/local/bin/docker-real")
+COMPOSE = "docker-compose"
+HUB = "100.102.49.114:19091/docker-hub"
+
+
+def run(args, **kwargs):
+    return subprocess.run([REAL, *args], **kwargs)
+
+
+def original_name(image: str) -> bool:
+    if "/" not in image:
+        return True
+    first = image.split("/", 1)[0]
+    return first in ("docker.io", "index.docker.io", "registry-1.docker.io") or (
+        "." not in first and ":" not in first and first != "localhost")
+
+
+def mapped_name(image: str) -> str:
+    if not original_name(image):
+        return image
+    name = image
+    for prefix in ("docker.io/", "index.docker.io/", "registry-1.docker.io/"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    if "/" not in name:
+        name = "library/" + name
+    return f"{HUB}/{name}"
+
+
+def ensure_image(image: str) -> str:
+    if not original_name(image) or "$" in image or image.lower() == "scratch":
+        return image
+    if run(["image", "inspect", image], stdout=subprocess.DEVNULL,
+           stderr=subprocess.DEVNULL).returncode == 0:
+        return image
+    mirror = os.environ.get("CDB_HUB_CACHE", "").strip()
+    if not mirror:
+        info = run(["info", "--format", "{{json .RegistryConfig.Mirrors}}"],
+                   text=True, capture_output=True, timeout=30)
+        mirrors = json.loads(info.stdout or "[]")
+        mirror = mirrors[0] if mirrors else ""
+    candidate = mapped_name(image)
+    if run(["image", "inspect", candidate], stdout=subprocess.DEVNULL,
+           stderr=subprocess.DEVNULL).returncode:
+        pull = run(["pull", candidate])
+        if pull.returncode and mirror:
+            mirror = mirror.removeprefix("http://").removeprefix("https://").rstrip("/")
+            cached = f"{mirror}/{candidate[len(HUB) + 1:]}"
+            run(["pull", cached], check=True)
+            run(["tag", cached, candidate], check=True)
+        elif pull.returncode:
+            raise SystemExit(pull.returncode)
+    return candidate
+
+
+def prepare_dockerfile(source: Path) -> None:
+    pattern = re.compile(r"^(\s*FROM\s+(?:--platform=\S+\s+)?)(\S+)(.*)$", re.I)
+    stages = set()
+    for line in source.read_text().splitlines():
+        match = pattern.match(line)
+        if match and match.group(2) not in stages and "$" not in match.group(2):
+            original = match.group(2)
+            mapped = ensure_image(original)
+            if mapped != original:
+                # Docker rejects tags whose reference contains a digest. The
+                # pinned image's content is already fetched and verified above;
+                # tag its repository/tag so the original FROM resolves locally.
+                local_name = original.split("@", 1)[0]
+                run(["tag", mapped, local_name], check=True)
+        if match:
+            stage = re.search(r"\s+AS\s+(\S+)", line, flags=re.I)
+            if stage:
+                stages.add(stage.group(1))
+
+
+def build(args: list[str]) -> None:
+    file_index = None
+    for index, arg in enumerate(args[:-1]):
+        if arg in ("-f", "--file"):
+            file_index = index + 1
+            break
+        if arg.startswith("--file="):
+            file_index = -index - 1
+            break
+    context = Path(args[-1]) if args and not args[-1].startswith("-") else Path.cwd()
+    source = Path(args[file_index]) if file_index and file_index > 0 else (
+        Path(args[-file_index - 1].split("=", 1)[1]) if file_index else Path("Dockerfile"))
+    if not source.is_absolute():
+        source = context / source
+    if source.is_file():
+        prepare_dockerfile(source)
+    os.execv(REAL, [REAL, *args])
+
+
+def compose(args: list[str]) -> None:
+    operation = next((index for index, arg in enumerate(args) if arg in ("up", "build", "create", "run", "pull", "start")), len(args))
+    base = args[:operation]
+    for index, arg in enumerate(base[:-1]):
+        if arg in ("-f", "--file"):
+            compose_file = Path(base[index + 1]).resolve()
+            os.chdir(compose_file.parent)
+            break
+    config = subprocess.run([REAL, *base, "config", "--format", "json"],
+                            text=True, capture_output=True)
+    if config.returncode:
+        sys.stdout.write(config.stdout)
+        sys.stderr.write(config.stderr)
+        raise SystemExit(config.returncode)
+    data = json.loads(config.stdout)
+    override = {"services": {}}
+    for name, service in (data.get("services") or {}).items():
+        build_data = service.get("build")
+        if isinstance(build_data, dict):
+            # Compose defaults an omitted dockerfile to <context>/Dockerfile.
+            # Skipping it bypasses the mirror for otherwise valid deliveries.
+            prepare_dockerfile(Path(build_data.get("context", "."))
+                               / build_data.get("dockerfile", "Dockerfile"))
+        if service.get("image") and not build_data:
+            override["services"][name] = {"image": ensure_image(service["image"])}
+    if not any(base[i] in ("-f", "--file") for i in range(len(base) - 1)):
+        base = [*base, "--file", "compose.yml"] if Path("compose.yml").is_file() else [*base, "--file", "docker-compose.yml"]
+    action = args[operation:]
+    if action and action[0] in ("up", "create") and "--pull" not in action:
+        action = [*action, "--pull", "never"]
+    if override["services"]:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", prefix=".cdb-kkrepo-compose-", dir=".") as file:
+            json.dump(override, file)
+            file.flush()
+            os.execv(REAL, [REAL, *base, "--file", file.name, *action])
+    os.execv(REAL, [REAL, *base, *action])
+
+
+def container_image(args: list[str]) -> list[str]:
+    """Resolve the image after run/create options without altering options."""
+    index = 1
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            index += 1
+            break
+        if not arg.startswith("-"):
+            break
+        if "=" not in arg and arg in {"-e", "--env", "-v", "--volume", "-p", "--publish",
+                                     "--network", "--name", "--workdir", "-w", "--user", "-u",
+                                     "--entrypoint", "--hostname", "--platform", "--add-host",
+                                     "--mount", "--tmpfs", "--device", "--cap-add", "--cap-drop",
+                                     "--security-opt", "--label", "-l", "--cpus", "--memory", "-m",
+                                     "--shm-size", "--runtime", "--restart", "--pull", "--pid",
+                                     "--ipc", "--uts", "--cgroupns", "--dns", "--dns-search"}:
+            index += 1
+        index += 1
+    if index < len(args) and original_name(args[index]):
+        mapped = ensure_image(args[index])
+        original = args[index]
+        args[index] = mapped
+        if mapped != original:
+            run(["tag", mapped, original], check=True)
+    return args
+
+
+def main() -> None:
+    if os.environ.get("CDB_KKREPO_DISABLE") == "1":
+        os.execv(REAL, [REAL, *sys.argv[1:]])
+    args = sys.argv[1:]
+    if args and args[0] == "pull" and len(args) >= 2 and original_name(args[-1]):
+        os.execv(REAL, [REAL, "pull", ensure_image(args[-1])])
+    if args and args[0] in ("run", "create"):
+        os.execv(REAL, [REAL, *container_image(args)])
+    elif args and (args[0] == "build" or args[:2] == ["buildx", "build"]):
+        build(args)
+    elif args and args[0] == "compose" and any(arg in args[1:] for arg in ("up", "build", "create", "run", "pull", "start")):
+        compose(args)
+    else:
+        os.execv(REAL, [REAL, *args])
+
+
+if __name__ == "__main__":
+    main()

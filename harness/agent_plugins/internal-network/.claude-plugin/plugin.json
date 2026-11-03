@@ -1,0 +1,8 @@
+{
+  "name": "internal-network",
+  "version": "1.0.0",
+  "description": "Read skills/kkrepo-network/SKILL.md before Docker builds and package installs. Use its mirrors and proxy build args.",
+  "author": {
+    "name": "CyberDockerBench"
+  }
+}
