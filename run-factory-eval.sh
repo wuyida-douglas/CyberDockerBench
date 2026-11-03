@@ -83,7 +83,7 @@ CONCURRENCY=20
 MODEL="${CDB_MODEL:-glm-5.3}"
 MAX_TURNS=50
 TIMEOUT=18000
-GRADE_TIMEOUT=1800
+GRADE_TIMEOUT=3600
 # One batch directory, tasks underneath: runtime/cvefactory-YYYYMMDDHHMM/<task_id>/
 RESULTS="${1:-$ROOT/runtime/cvefactory-$(date +%Y%m%d%H%M)}"
 shift 2>/dev/null || true

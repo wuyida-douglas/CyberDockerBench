@@ -83,6 +83,7 @@ def tail(value: str | None, limit: int = 6000) -> str:
 # NO_PROXY entries keep working, and put the live one in KKREPO_HOST.
 KKREPO_HOST = '100.102.49.114'
 DIRECT_MIRROR_HOSTS = ('100.102.49.113', KKREPO_HOST)
+DIRECT_PACKAGE_HOSTS = ('pkg.pjlab.org.cn',)
 
 
 def _with_direct_hosts(no_proxy: str) -> str:
@@ -91,7 +92,7 @@ def _with_direct_hosts(no_proxy: str) -> str:
     or the site jump proxy can. Guarantee them in NO_PROXY regardless of
     the caller's environment."""
     parts = [part for part in (no_proxy or '').split(',') if part]
-    for host in (*DIRECT_MIRROR_HOSTS, *direct_registry_hosts()):
+    for host in (*DIRECT_MIRROR_HOSTS, *DIRECT_PACKAGE_HOSTS, *direct_registry_hosts()):
         if host not in parts:
             parts.append(host)
     return ','.join(parts)
@@ -310,6 +311,21 @@ def release_address_lease(data_root: Path, container: str) -> None:
                     path.unlink(missing_ok=True)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def sandbox_proxy_environment() -> list[str]:
+    """Supply shell/Compose variables and mandatory direct mirror routes."""
+    arguments = []
+    has_proxy = any(os.environ.get(key) for key in (
+        'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'))
+    for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
+                'http_proxy', 'https_proxy', 'no_proxy'):
+        value = os.environ.get(key, '')
+        if value or (key.lower() == 'no_proxy' and has_proxy):
+            if key.lower() == 'no_proxy':
+                value = _with_direct_hosts(value)
+            arguments.extend(('-e', f'{key}={value}'))
+    return arguments
 
 
 @dataclass
@@ -612,13 +628,10 @@ class DockerSandbox:
             command += ['-v', f'{self.name}-home:/home/agent']
             for source, target in self.agent_plugin_mounts:
                 command += ['-v', f'{source}:{target}:ro']
-            for key in ('CDB_DIND_MTU', 'HTTP_PROXY', 'HTTPS_PROXY',
-                        'http_proxy', 'https_proxy', 'NO_PROXY', 'no_proxy'):
-                value = os.environ.get(key)
-                if value:
-                    if key in ('NO_PROXY', 'no_proxy'):
-                        value = _with_direct_hosts(value)
-                    command += ['-e', f'{key}={value}']
+            mtu = os.environ.get('CDB_DIND_MTU')
+            if mtu:
+                command += ['-e', f'CDB_DIND_MTU={mtu}']
+            command += sandbox_proxy_environment()
             command += [SANDBOX_IMAGE, 'dockerd', *self._start_args]
             cp = run(command, timeout=90)
             if cp.returncode:
@@ -757,6 +770,16 @@ class DockerSandbox:
                 user='agent', timeout=30)
             if plugin.returncode:
                 raise SandboxError(f'network plugin must be readable and read-only: {target}')
+        environment = {key: os.environ.get(key, '') for key in (
+            'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
+            'http_proxy', 'https_proxy', 'no_proxy')}
+        if any(environment[key] for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy')):
+            for key, value in environment.items():
+                expected = _with_direct_hosts(value) if key.lower() == 'no_proxy' else value
+                actual = self.exec(['bash', '-c', f'printf %s "${key}"'],
+                                   user='agent', timeout=30)
+                if actual.returncode or actual.stdout != expected:
+                    raise SandboxError(f'grading/agent shell proxy mismatch: {key}')
         mtu = os.environ.get('CDB_DIND_MTU')
         actual_mtu = None
         if mtu:

@@ -942,6 +942,7 @@ def run_one(task_dir: Path | str, results_dir: Path | str,
             if missing and record['agent']['status'] == 'completed':
                 record['agent']['status'] = 'incomplete'
                 record['agent']['error'] = 'missing required deliverables: ' + ', '.join(missing)
+                record['error'] = record['agent']['error']
             if record['agent']['status'] != 'completed':
                 # A normal CLI failure/turn limit/incomplete delivery is a
                 # semantic outcome, not a Python pipeline exception.
@@ -951,6 +952,7 @@ def run_one(task_dir: Path | str, results_dir: Path | str,
         _set_pipeline_exception(record, exc, phase)
         emit(console_path, f'pipeline exception during {phase}: {type(exc).__name__}: {exc}')
     finally:
+        missing = record.get('missing_deliverables', [])
         if not debug_finalized and sandbox_started and phase == 'agent':
             try:
                 _finalize_debug_log(sandbox, out_dir)
@@ -958,7 +960,18 @@ def run_one(task_dir: Path | str, results_dir: Path | str,
                 record.setdefault('cleanup_errors', []).append(redact_text(str(exc)))
         # Collection is intentionally unconditional after a started sandbox,
         # including agent timeout/error and preflight failure.  No grader runs.
-        if sandbox_started and not preflight_only and record.get('preflight', {}).get('success'):
+        if missing:
+            # Contract omissions belong to the submitted application, not to the
+            # snapshot machinery. A genuine exception freezing present files is
+            # still an export failure below.
+            record['export'].update({
+                'status': 'skipped_missing_deliverables',
+                'missing': missing,
+                'error': record['agent']['error'],
+                'finished_at': utc_now(),
+            })
+            emit(console_path, 'delivery not exported: ' + record['agent']['error'])
+        elif sandbox_started and not preflight_only and record.get('preflight', {}).get('success'):
             phase = 'export'
             record['attempts']['bundle_export'] += 1
             _set_phase(record, out_dir, phase)

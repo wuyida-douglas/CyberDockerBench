@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -181,6 +182,38 @@ assert preflight.run_preflight is run_agent.run_preflight
         self.assertTrue(all(call.kwargs.get('user') == 'agent'
                             for call in execute.call_args_list))
 
+    def test_shell_proxy_matches_compose_interpolation_environment(self):
+        sandbox, outer, inner = self.isolation_sandbox()
+        proxy = {'HTTPS_PROXY': 'http://proxy.invalid:8080', 'NO_PROXY': 'localhost,127.0.0.1'}
+        with mock.patch.dict(os.environ, proxy, clear=True):
+            from harness.docker_sandbox import sandbox_proxy_environment
+            arguments = sandbox_proxy_environment()
+        injected = dict(arguments[i + 1].split('=', 1)
+                        for i, argument in enumerate(arguments) if argument == '-e')
+        def shell(args, **kwargs):
+            if not args[-1].startswith('printf %s "$'):
+                return subprocess.CompletedProcess(args, 0, '', '')
+            key = args[-1].split('$')[1].strip('}"')
+            return subprocess.CompletedProcess(args, 0, injected.get(key, ''), '')
+        with mock.patch.object(sandbox, '_host', return_value=subprocess.CompletedProcess(
+                [], 0, json.dumps([outer]), '')), \
+                mock.patch.object(sandbox, 'docker', return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(inner), '')), \
+                mock.patch.object(sandbox, 'exec', side_effect=shell), \
+                mock.patch.dict(os.environ, proxy, clear=True):
+            sandbox.inspect_contract()
+
+    def test_missing_shell_proxy_is_rejected_before_grading(self):
+        sandbox, outer, inner = self.isolation_sandbox()
+        with mock.patch.object(sandbox, '_host', return_value=subprocess.CompletedProcess(
+                [], 0, json.dumps([outer]), '')), \
+                mock.patch.object(sandbox, 'docker', return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(inner), '')), \
+                mock.patch.object(sandbox, 'exec', return_value=subprocess.CompletedProcess([], 0, '', '')), \
+                mock.patch.dict(os.environ, {'HTTPS_PROXY': 'http://proxy.invalid:8080'}, clear=True), \
+                self.assertRaisesRegex(SandboxError, 'shell proxy mismatch: HTTPS_PROXY'):
+            sandbox.inspect_contract()
+
     def test_unexpected_or_host_socket_mount_is_rejected(self):
         sandbox, outer, inner = self.isolation_sandbox()
         outer['Mounts'].append({'Type': 'bind', 'Source': '/var/run/docker.sock',
@@ -259,10 +292,19 @@ class DirectHostsTest(unittest.TestCase):
         self.assertEqual(merged.split(',').count('100.102.49.113'), 1)
 
     def test_empty_no_proxy(self):
+        from harness.docker_sandbox import sandbox_proxy_environment
+        with mock.patch.dict(os.environ, {'HTTPS_PROXY': 'http://proxy.invalid'}, clear=True):
+            arguments = sandbox_proxy_environment()
+        values = [arguments[i + 1] for i, argument in enumerate(arguments) if argument == '-e']
+        self.assertIn('HTTPS_PROXY=http://proxy.invalid', values)
+        self.assertIn('NO_PROXY=100.102.49.113,100.102.49.114,pkg.pjlab.org.cn', values)
+        self.assertIn('no_proxy=100.102.49.113,100.102.49.114,pkg.pjlab.org.cn', values)
+
+    def test_direct_hosts_deduplicate_mirror_and_pypi(self):
         from harness.docker_sandbox import _with_direct_hosts
         self.assertEqual(
             _with_direct_hosts(''),
-            '100.102.49.113,100.102.49.114')
+            '100.102.49.113,100.102.49.114,pkg.pjlab.org.cn')
 
 
 if __name__ == '__main__':

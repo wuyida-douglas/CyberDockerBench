@@ -26,7 +26,7 @@ DEFAULT_CONCURRENCY = 20
 DEFAULT_MODEL = 'glm-5.3'
 DEFAULT_MAX_TURNS = 50
 DEFAULT_TIMEOUT = 18000
-DEFAULT_GRADE_TIMEOUT = 10800
+DEFAULT_GRADE_TIMEOUT = 3600
 RUNNER_GRACE_SECONDS = 3600
 
 
@@ -142,8 +142,9 @@ def run_one(task: Path, root: Path, args: argparse.Namespace) -> dict:
     grade_result = output / 'result.json'
     try:
         agent_record = json.loads(stored_agent.read_text()) if stored_agent.exists() else {}
-        if (agent_record.get('export', {}).get('status') != 'completed'
-                or not (bundle / 'bundle.json').is_file() or args.force_agent):
+        if (not agent_record.get('missing_deliverables')
+                and (agent_record.get('export', {}).get('status') != 'completed'
+                     or not (bundle / 'bundle.json').is_file()) or args.force_agent):
             # An agent rerun invalidates the previous grade; do not let an
             # incomplete/timeout rerun silently reuse the old reward.
             if stored_grade.exists():
@@ -162,10 +163,21 @@ def run_one(task: Path, root: Path, args: argparse.Namespace) -> dict:
                 os.replace(output / 'result.json', agent_result)
             record = json.loads(agent_result.read_text()) if agent_result.exists() else {}
             execution_failure = agent_execution_failure(record)
+            if record.get('missing_deliverables') and record.get('failure_category') == 'agent_semantic':
+                return {'task_id': name, 'status': 'failed', 'reward': 0,
+                        'failure_class': 'agent_semantic',
+                        'agent_status': record.get('agent', {}).get('status'),
+                        'export_status': record.get('export', {}).get('status'),
+                        'error': record.get('agent', {}).get('error'),
+                        'missing_deliverables': record['missing_deliverables']}
             if cp.returncode or record.get('export', {}).get('status') != 'completed' or execution_failure:
                 category = record.get('failure_category') or 'pipeline'
                 error = record.get('error') or record.get('export', {}).get('error')
-                if execution_failure:
+                if record.get('missing_deliverables') and record.get('agent', {}).get('status') in {
+                        'completed', 'incomplete', 'timeout', 'turn_limit'}:
+                    category = 'agent_semantic'
+                    error = record.get('agent', {}).get('error') or error
+                elif execution_failure:
                     category = execution_failure['failure_class']
                     error = execution_failure['error']
                 return {'task_id': name,
@@ -175,7 +187,8 @@ def run_one(task: Path, root: Path, args: argparse.Namespace) -> dict:
                         'agent_status': record.get('agent', {}).get('status'),
                         'export_status': record.get('export', {}).get('status'),
                         'error': error,
-                        'exit_code': cp.returncode}
+                        'exit_code': cp.returncode,
+                        'missing_deliverables': record.get('missing_deliverables', [])}
         if not agent_result.exists() and stored_agent.exists():
             agent_result = stored_agent
         if not grade_result.exists() and stored_grade.exists():
@@ -192,6 +205,16 @@ def run_one(task: Path, root: Path, args: argparse.Namespace) -> dict:
         # A turn-limited/incomplete session may still leave a complete frozen
         # project. Grade that real delivery; only API/transport errors above
         # are excluded. Its incomplete agent status stays in agent-result.json.
+        if record.get('missing_deliverables') and (
+                record.get('failure_category') == 'agent_semantic'
+                or record.get('agent', {}).get('status') in {
+                    'completed', 'incomplete', 'timeout', 'turn_limit'}):
+            return {'task_id': name, 'status': 'failed', 'reward': 0,
+                    'failure_class': 'agent_semantic',
+                    'agent_status': record.get('agent', {}).get('status'),
+                    'export_status': record.get('export', {}).get('status'),
+                    'error': record.get('agent', {}).get('error'),
+                    'missing_deliverables': record['missing_deliverables']}
         if not args.skip_grade and (not grade_result.exists() or args.force_grade):
             if grade_result.exists():
                 os.replace(grade_result, output / 'previous-result.json')

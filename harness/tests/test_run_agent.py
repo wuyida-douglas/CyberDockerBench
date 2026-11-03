@@ -428,7 +428,24 @@ class RunnerContractTests(unittest.TestCase):
         self.assertIn('container-network-explicit-deployment-config',
                       [step['name'] for step in report['steps']])
 
-    def test_agent_incomplete_is_semantic_but_bundle_is_still_exported(self):
+    def test_incomplete_with_valid_files_is_semantic_and_still_exported(self):
+        def fake_stream(sandbox, cmd, out_dir, timeout_sec, extra_env, console_path=None, max_turns=None):
+            self.deliver(sandbox)
+            (out_dir / 'trajectory.jsonl').write_text(json.dumps({
+                'type': 'result', 'is_error': False, 'num_turns': 3, 'result': 'built',
+            }) + '\n')
+            return FakeProcess()
+
+        with mock.patch.object(runner, 'DockerSandbox', FakeSandbox), \
+                mock.patch.object(runner, 'stream_agent', fake_stream), \
+                mock.patch('harness.bundle.export_bundle', return_value={}) as exported, \
+                mock.patch.dict(runner.os.environ, self.credentials(), clear=True):
+            record = runner.run_one(self.task, self.results)
+        self.assertEqual(record['agent']['status'], 'completed')
+        self.assertEqual(record['failure_category'], None)
+        exported.assert_called_once()
+
+    def test_missing_contract_files_are_semantic_not_export_error(self):
         def fake_stream(sandbox, cmd, out_dir, timeout_sec, extra_env, console_path=None, max_turns=None):
             (out_dir / 'trajectory.jsonl').write_text(json.dumps({
                 'type': 'result', 'is_error': False, 'num_turns': 3, 'result': 'built',
@@ -444,10 +461,14 @@ class RunnerContractTests(unittest.TestCase):
         self.assertEqual(record['pipeline']['status'], 'succeeded')
         self.assertEqual(record['failure_category'], 'agent_semantic')
         self.assertIsNone(record['pipeline']['exception'])
-        exported.assert_called_once()
+        self.assertEqual(record['export']['status'], 'skipped_missing_deliverables')
+        self.assertEqual(record['export']['missing'], list(runner.REQUIRED_DELIVERABLES))
+        self.assertIn('docker-compose.yaml', record['error'])
+        exported.assert_not_called()
 
     def test_agent_deadline_is_semantic_and_frozen_delivery_is_still_exported(self):
-        def timeout(*args, **kwargs):
+        def timeout(sandbox, *args, **kwargs):
+            self.deliver(sandbox)
             raise subprocess.TimeoutExpired('claude', 5)
 
         with mock.patch.object(runner, 'DockerSandbox', FakeSandbox), \
@@ -695,14 +716,14 @@ class RunnerContractTests(unittest.TestCase):
         self.assertEqual(args.model, 'glm-5.3')
         self.assertEqual(args.max_turns, 50)
         self.assertEqual(args.timeout, 18000)
-        self.assertEqual(args.grade_timeout, 10800)
+        self.assertEqual(args.grade_timeout, 3600)
         self.assertEqual(args.concurrency, 20)
         self.assertEqual(batch.RUNNER_GRACE_SECONDS, 3600)
 
     def test_run_eval_uses_code_defaults_and_explicit_model_override(self):
         text = (ROOT / 'run-factory-eval.sh').read_text()
         for setting in ('CONCURRENCY=20', 'MODEL="${CDB_MODEL:-glm-5.3}"', 'MAX_TURNS=50',
-                        'TIMEOUT=18000', 'GRADE_TIMEOUT=1800',
+                        'TIMEOUT=18000', 'GRADE_TIMEOUT=3600',
                         'TASKS="$ROOT/delivery/cvefactory-verified-40-20261026/tasks"',
                         ': "${ANTHROPIC_BASE_URL:?set ANTHROPIC_BASE_URL in CDB_MODEL_ENV_FILE}"',
                         'RESULTS="${1:-$ROOT/runtime/cvefactory-$(date +%Y%m%d%H%M)}"'):
@@ -864,6 +885,22 @@ class BatchContractTests(unittest.TestCase):
         self.assertEqual(result['status'], 'error')
         self.assertIn('missing frozen delivery', result['error'])
         self.assertEqual(json.loads((self.output / 'previous-result.json').read_text())['reward'], 1)
+
+    def test_missing_delivery_from_preserved_agent_record_is_semantic(self):
+        (self.output / 'agent-result.json').write_text(json.dumps({
+            'agent': {'status': 'incomplete', 'error': 'missing required deliverables: docker-compose.yaml'},
+            'export': {'status': 'skipped_missing_deliverables'},
+            'pipeline': {'status': 'succeeded'},
+            'failure_category': 'agent_semantic',
+            'missing_deliverables': ['docker-compose.yaml'],
+        }))
+        with mock.patch.object(batch.subprocess, 'run') as run:
+            result = batch.run_one(self.task, self.root / 'results', self.args(force_agent=False))
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['failure_class'], 'agent_semantic')
+        self.assertEqual(result['missing_deliverables'], ['docker-compose.yaml'])
+        self.assertIn('docker-compose.yaml', result['error'])
+        run.assert_not_called()
 
     def test_preflight_and_api_stops_go_back_on_the_queue(self):
         self.assertEqual(batch.infrastructure_requeue_reason({
